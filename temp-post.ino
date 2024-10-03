@@ -1,54 +1,30 @@
 #include <WiFiS3.h>
 #include <ArduinoHttpClient.h>
 #include "settings.h"
+#include "DHT.h"
+
+#define DHTPIN 2 
+#define DHTTYPE DHT22   // DHT 22  (AM2302), AM2321
+
+DHT dht(DHTPIN, DHTTYPE);
 
 char ssid[] = SECRET_SSID;
 char password[] = SECRET_PASS;
 
-char serverAdress[] = "192.168.1.166";  // Server IP
+char serverAdress[] = "192.168.1.166";  
 int port = 8080;
 
 WiFiClient wifi;
 HttpClient client = HttpClient(wifi, serverAdress, port);
 
-// DHT11 Sensor code
-int DHpin = 8; // input/output pin
-byte dat[5];
 
-byte read_data() {
-  byte data;
-  for (int i = 0; i < 8; i++) {
-    if (digitalRead(DHpin) == LOW) {
-      while (digitalRead(DHpin) == LOW); // wait 50us;
-      delayMicroseconds(30); // Duration of high level determines whether data is 0 or 1
-      if (digitalRead(DHpin) == HIGH)
-        data |= (1 << (7 - i)); // High in the former, low in the post;
-      while (digitalRead(DHpin) == HIGH); // Data '1', waiting for next bit
-    }
-  }
-  return data;
-}
-
-void start_test() {
-  digitalWrite(DHpin, LOW); // Pull down the bus to send the start signal;
-  delay(30); // The delay is greater than 18 ms so that DHT 11 can detect the start signal;
-  digitalWrite(DHpin, HIGH);
-  delayMicroseconds(40); // Wait for DHT11 to respond;
-  pinMode(DHpin, INPUT);
-  while (digitalRead(DHpin) == HIGH);
-  delayMicroseconds(80); // The DHT11 responds by pulling the bus low for 80us;
-  if (digitalRead(DHpin) == LOW);
-  delayMicroseconds(80); // DHT11 pulled up after the bus 80us to start sending data;
-  for (int i = 0; i < 4; i++) // Receiving data, check bits are not considered;
-    dat[i] = read_data();
-  pinMode(DHpin, OUTPUT);
-  digitalWrite(DHpin, HIGH); // After release of bus, wait for host to start next signal
-}
 
 void setup() {
   // WiFi Setup
   Serial.begin(9600);
-  pinMode(DHpin, OUTPUT);
+  Serial.println(F("DHTxx test!"));
+
+  dht.begin();
 
   Serial.println("Ansluter till Wifi");
   WiFi.begin(ssid, password);
@@ -61,26 +37,41 @@ void setup() {
 }
 
 void loop() {
-  // Read DHT11 sensor
-  start_test();
-  int humidityInt = dat[0]; // Integer part of humidity
-  int humidityDec = dat[1]; // Decimal part of humidity
-  int tempInt = dat[2];     // Integer part of temperature
-  int tempDec = dat[3];     // Decimal part of temperature
+  
+  delay(2000);
 
-  Serial.print("Current humidity = ");
-  Serial.print(humidityInt);
-  Serial.print('.');
-  Serial.print(humidityDec);
-  Serial.println('%');
-  Serial.print("Current temperature = ");
-  Serial.print(tempInt);
-  Serial.print('.');
-  Serial.print(tempDec);
-  Serial.println('C');
+  float h = dht.readHumidity();
+  // Read temperature as Celsius (the default)
+  float t = dht.readTemperature();
+  // Read temperature as Fahrenheit (isFahrenheit = true)
+  float f = dht.readTemperature(true);
 
-  // Prepare JSON payload with temp and humidity
-  String postData = "{\"temp\":\"" + String(tempInt) + "." + String(tempDec) + "\",\"humidity\":\"" + String(humidityInt) + "." + String(humidityDec) + "\"}";
+  // Check if any reads failed and exit early (to try again).
+  if (isnan(h) || isnan(t) || isnan(f)) {
+    Serial.println(F("Failed to read from DHT sensor!"));
+    return;
+  }
+
+  // Compute heat index in Fahrenheit (the default)
+  float hif = dht.computeHeatIndex(f, h);
+  // Compute heat index in Celsius (isFahreheit = false)
+  float hic = dht.computeHeatIndex(t, h, false);
+
+  Serial.print(F("Humidity: "));
+  Serial.print(h);
+  Serial.print(F("%  Temperature: "));
+  Serial.print(t);
+  Serial.print(F("°C "));
+  Serial.print(f);
+  Serial.print(F("°F  Heat index: "));
+  Serial.print(hic);
+  Serial.print(F("°C "));
+  Serial.print(hif);
+  Serial.println(F("°F"));
+  
+
+  
+  String postData = "{\"temp\":\"" + String(t, 2) + "\",\"humidity\":\"" + String(h, 2) + "\"}";
 
   if (WiFi.status() != WL_CONNECTED) {
   Serial.println("WiFi connection lost. Reconnecting...");
@@ -92,26 +83,43 @@ void loop() {
   Serial.println("Reconnected to WiFi.");
 }
 
+  bool success = false;
+  int retryCount = 0;
+  const int maxRetries = 3;
 
-  // Send POST request to server
-  Serial.println("Skickar vår POST");
-  client.beginRequest();
-  client.post("/temps/temp");
+  while (!success && retryCount < maxRetries) {
+    Serial.println("Skickar vår POST");
+    client.beginRequest();
+    client.post("/api/sensor");
 
-  client.sendHeader("Content-Type", "application/json");
-  client.sendHeader("Content-Length", postData.length());
+    client.sendHeader("Content-Type", "application/json");
+    client.sendHeader("Content-Length", postData.length());
 
-  client.beginBody();
-  client.print(postData);
-  client.endRequest();
+    client.beginBody();
+    client.print(postData);
+    client.endRequest();
 
-  int statusCode = client.responseStatusCode();
-  String response = client.responseBody();
+    int statusCode = client.responseStatusCode();
+    String response = client.responseBody();
 
-  Serial.print("Status code: ");
-  Serial.println(statusCode);
-  Serial.print("Response: ");
-  Serial.println(response);
+    Serial.print("Status code: ");
+    Serial.println(statusCode);
+    Serial.print("Response: ");
+    Serial.println(response);
+
+    if (statusCode == 200) {
+      success = true;
+      Serial.println("POST request successful.");
+    } else {
+      retryCount++;
+      Serial.println("POST request failed, retrying...");
+      delay(2000); 
+    }
+  }
+
+  if (!success) {
+    Serial.println("Failed to send POST after retries.");
+  }
 
   delay(900000);
 }
